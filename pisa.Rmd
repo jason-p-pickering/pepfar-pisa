@@ -1,0 +1,518 @@
+---
+title: "Data munging with DATIM"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+In this excercise, we will use some of the basic functions of the DHIS2 metadata and analytics API.
+
+We will use the R programming language, but other languages such as `python` would also be capable of performing this. 
+
+To get started, be sure you have installed `R` and `RStudio`. 
+
+You can donwload R for your operating system [here](https://cran.r-project.org/mirrors.html).
+You can download RStudio for your operating system [here](https://www.rstudio.com/products/rstudio/download/).
+
+We need to load a number of other packages as well: 
+
+* keyringr: A package to load passwords from a secure store.
+* httr: A package for making HTTP requests
+* jsonlite: A package for working with JSON objects.
+* tidyverse: Packages for data science [More info here](https://www.tidyverse.org/)
+
+
+```{r}
+require(pacman)
+pacman::p_load(keyringr,httr,jsonlite,tidyverse,magrittr)
+```
+
+
+You should never store passwords in your source file. There are numerous methods to deal with this, but lets use the `keyringr` package. You can read how this works [here](https://cran.r-project.org/web/packages/keyringr/vignettes/Avoiding_plain_text_passwords_in_R_with_keyringr.html)
+
+You can decide if you would also like to encrypt your username, but otherwise, you can adjust it here. 
+
+We will also define a variable which defines the server we are going to communicate with. 
+
+```{r}
+#Store password in a variable
+# mypwd_foo<-.rs.askForPassword("Enter your password:")
+# mypwd<-function() { 
+#    return(mypwd_foo)
+# }
+
+#Get from a keyring
+mypwd<-function() { 
+   foo<-decrypt_gk_pw("site pisa user jpickering")
+   return(foo)
+   }
+#myuser<-.rs.askForPassword("Enter your username:")
+myuser<-"jpickering"
+#mypwd<-.rs.askForPassword("Enter your password:")
+baseurl<-"https://pisa.datim.org/"
+```
+
+
+Let's get a listing of data elements. 
+
+```{r}
+
+url<-paste0(baseurl,"api/dataElements")
+
+des<-URLencode(url) %>%
+GET(.,timeout(60),authenticate(myuser,mypwd())) %>% 
+content(.,"text") %>% 
+fromJSON(.,flatten=TRUE) 
+
+str(des)
+```
+
+The server returns a response with two lists: "pager" and "dataElements". 
+
+JSON objects can be complex lists of  lists. They are not "flat tables" but a common problem we will have to deal with is how to transform them into flat tables to more easily work with them.
+
+The "pager" list contains information about how many pages are available, which page we are currently viewing, and the total number of objects which are available. 
+
+Lets modify the URL and get all of the data elements
+
+```{r}
+url<-paste0(baseurl,"api/dataElements?paging=false")
+
+des<-URLencode(url) %>%
+GET(.,timeout(60),authenticate(myuser,mypwd())) %>% 
+content(.,"text") %>% 
+fromJSON(.,flatten=TRUE) 
+
+nrow(des$dataElements)
+```
+
+Now it looks like we have all of the data elements. 
+
+The metadata API can be filtered with a number of different operations. A full listing is available [here](https://docs.dhis2.org/master/en/developer/html/webapi_metadata_object_filter.html)
+
+Let's try and find all data elements related to OVC_SERV. All we will do is to add the `filter` paramater
+to the URL, and then specify the filter like this:
+
+`property:operator:filter`
+
+```{r}
+url<-paste0(baseurl,"api/dataElements?paging=false&filter=name:like:OVC_SERV")
+
+getDataElements<-function(url,username,password) {
+URLencode(url) %>%
+GET(.,timeout(60),authenticate(username,password)) %>% 
+content(.,"text") %>% 
+fromJSON(.,flatten=TRUE) %>%
+pluck("dataElements") }
+
+des<-getDataElements(url,myuser,mypwd())
+```
+
+Lets check and be sure all of the data elements are OVC_SERV related. 
+
+```{r}
+all(grepl('OVC_SERV',des$displayName))
+```
+
+Next, lets find all TX_CURR data elemnets with service delivery type of TA. Note in this case, that the default operation is to combine the filters, so that both conditions are met.
+
+```{r}
+url<-paste0(baseurl,"api/dataElements?filter=name:like:TX_CURR&paging=false")
+des<-getDataElements(url,myuser,mypwd())
+my_filter<-grepl('TA,',des$displayName) | grepl('TA)',des$displayName)
+
+des<-des[my_filter,]
+des
+```         
+
+We can also easily combine multiple requests into a single data table. In this case, lets combine 
+
+```{r}
+#The program areas we are interested in
+filters<-c("TX_CURR","OVC_SERV")
+#Create a list of URLs
+urls<-paste0(baseurl,"api/dataElements?filter=name:like:",filters,"&paging=false")
+des<-lapply(urls,function(x) getDataElements(x,myuser,mypwd())) %>% bind_rows()
+des
+```
+
+
+## Excercise 1: Working with the metadata API
+
+Based on your knowledge of how to use the API and the MER data elements, create a CSV file which contains the following columns for all HTS_TST data elements.
+
+* Data element name
+* Technical area
+* Support type
+* Numerator/Denominator
+* A boolean flag, if this data element is a narrative
+* A derived data element name, which is common between target/result pairs.
+
+
+```{r}
+require(stringr)
+url<-paste0(baseurl,"api/dataElements?paging=false&filter=name:like:HTS_TST")
+des<-getDataElements(url,myuser,mypwd()) %>% 
+  mutate(target_result = case_when( grepl("TARGET",displayName) ~ "TARGET", 
+                                    grepl("T_PSNU",displayName) ~ "PSNU_TARGETS",
+                                          TRUE ~ "RESULT"),
+         neutral_name = str_trim(gsub(" TARGET:",":",displayName)) )
+
+#Generic function to extract a part 
+getListElement<-function(x,n) tryCatch(str_trim(str_split(x,","))[[n]],  error = function(e) return(NA))
+```
+
+Its a bit easier to work with the classification of the data elements with another object. We can then join them back the two seperate objects. 
+
+```{r}
+#Classification
+classification<-data.frame(classification=gsub("\\)","",gsub("\\(","",str_extract_all(des$displayName,"\\(.+\\)")))) %>%
+separate(classification,c("num_denom","support_type","disagg_type"),",") %>% 
+mutate(is_narrative = case_when(grepl("NARRATIVE",support_type) ~ TRUE,
+         TRUE ~ FALSE))
+des<-bind_cols(des,classification)
+des
+```
+
+
+Now that we have a data frame of our data elements, lets make one more, which will provide a mapping between results and targets of the same data element. 
+
+```{r}
+des_targets<-des %>% 
+  filter(target_result == "TARGET") %>% 
+  select(targets_id=id,neutral_name,targets_name=displayName)
+
+des_results<-des %>% 
+  filter(target_result == "RESULT")  %>% 
+  select(results_id=id,neutral_name,results_name=displayName)
+
+
+des_results_targets <- full_join(des_targets,des_results,by=c("neutral_name")) %>%
+select(targets_id,targets_name,results_id,results_name) %>%
+arrange(targets_name)
+
+des_results_targets
+write.csv(des_results_targets,file="mydataelements.csv",row.names=FALSE)
+```
+
+Lastly, which data elements do not have a corresponding targets or results pair?
+
+```{r}
+des_results_targets %>% 
+filter(!complete.cases(.))
+
+```
+
+
+## Excercise 2: Working with the organisation units API
+
+Now we have worked a bit with data elements, lets extend this to retreiving other properties of the objects. We will get all of the sites in Zambia. First, we need to know how to limit our query to only sites in Zambia. 
+
+```{r}
+url<-paste0(baseurl,"api/organisationUnits?filter=level:eq:3")
+ou3<-URLencode(url) %>%
+GET(.,timeout(60),authenticate(myuser,mypwd())) %>% 
+content(.,"text") %>% 
+fromJSON(.,flatten=TRUE) 
+ou3$organisationUnits
+```
+
+We see that Zambia has a UID of `f5RoebaDLMx`. The `path` property of organisation units will provide us the full path of the site within the organisation unit hierarchy. Lets get all sites in Zambia, along with their path. 
+
+
+```{r}
+#install.packages("rlist")
+url<-paste0(baseurl,"api/organisationUnits?filter=path:like:f5RoebaDLMx&fields=id,name,path,coordinates&paging=false")
+ous<-URLencode(url) %>%
+GET(.,timeout(60),authenticate(myuser,mypwd())) %>% 
+content(.,"text") %>% 
+fromJSON(.,flatten=TRUE) %>% 
+rlist::list.extract(.,"organisationUnits")
+```
+
+Next, lets try and flatten the path into columns, which will make it easier to work with. 
+
+```{r}
+ous$path<-gsub("^/","",ous$path)
+cols=paste0("ou",seq(1,max(str_count(ous$path,"/"))))
+ou_structure<-separate(ous,`path`,into=cols,sep="/") %>% select(-ou1,-ou2,-ou3)
+head(ou_structure)
+```
+
+We have now a flat data table with the name of the site, its UID and parent UIDs. Lets transform this a
+bit to get the names of the parents.  
+
+```{r}
+from_to<-ous[,c("id","name")]
+ou_structure$ou4<-plyr::mapvalues(ou_structure$ou4,from_to$id,from_to$name,warn_missing = FALSE)
+ou_structure$ou5<-plyr::mapvalues(ou_structure$ou5,from_to$id,from_to$name,warn_missing = FALSE)
+head(ou_structure)
+```
+
+Great, now it looks like we have a map of all sites, along with their province and district names. 
+
+## Excercise 3: Analytics API
+
+A very common problem we experience with DATIM is trying to pull too much data into a pivot table. Because of the large number of sites, data elmements and disaggregations, it is very easy to end up with a large matrix of data with dozens of coulmns and thousands of rows. In this example, lets try and get all of the data, including disaggregates, for HTS_TST, OtherPITC modality. 
+
+We can start simple function which will help us to cast the analytics response into a flat data table for easier manipulation. 
+
+```{r}
+d2_analyticsResponse <- function(url,username,password,remapCols=TRUE) {
+  d <- fromJSON(content(GET(url,authenticate(username,password)), "text"))
+  if ( NROW(d$rows) > 0 ) {
+  metadata <- do.call(rbind,
+                      lapply(d$metaData$items,
+                             data.frame, stringsAsFactors = FALSE)) %>% mutate(., from = row.names(.))
+  remapMeta <-
+    function(x) {
+      plyr::mapvalues(x, metadata$from, metadata$name, warn_missing = FALSE)
+    }
+  
+    d<-as.tibble(d$rows) %>% `names<-`(., d$headers$column)
+
+    if(remapCols == TRUE) {
+      d<-plyr::colwise(remapMeta)(d)
+    }
+    return(d) } else {
+      return(NULL)
+    }
+}
+
+```
+
+
+Lets try and get all of the data for HTS_TST (N, DSD, OtherPITC/Age/Sex/Result): HTS received results for Zambia for the last quarter. 
+
+How an DHIS2 analytics URL is covered in detail in the DHIS2 Developers manual: [here](https://docs.dhis2.org/master/en/developer/html/webapi_analytics.html). The most important paramaters are: 
+* dx: This represents the data dimension, typically data elements or indicators
+* pe: The time dimension. Can be either a relative or fixed period
+* ou: The organisation unit dimension. 
+
+```{r}
+url<-paste0(baseurl,"api/26/analytics.json?dimension=co&dimension=dx:H7Iu1SBCLTm&dimension=pe:LAST_QUARTER&filter=ou:f5RoebaDLMx&displayProperty=SHORTNAME&skipMeta=false")
+
+hts_data<-d2_analyticsResponse(url,myuser,mypwd()) %>% 
+  separate(`Category option combo`,into=c("Age","Sex","Test status"),sep=",") %>%
+  mutate(`Value` = as.numeric(`Value`))
+
+head(hts_data)
+```
+
+That looks like a good start, but lets see if we can pull in the organisation unit dimension. We need to excercise a bit more caution with how to restructure the data this time, so we can just pull apart the function we used earlier a bit. 
+
+```{r}
+url<-paste0(baseurl,"api/26/analytics.json?dimension=co&dimension=dx:H7Iu1SBCLTm&dimension=ou:LEVEL-6;f5RoebaDLMx&dimension=pe:LAST_QUARTER&displayProperty=SHORTNAME&skipMeta=false&hierarchyMeta=true")
+
+hts_data<- fromJSON(content(GET(url,authenticate(myuser,mypwd())), "text"))
+  
+names(hts_data)
+```
+
+We can see that the metadata response has a few lists inside its structure. 
+
+```{r}
+str(hts_data$headers)
+```
+
+
+The `rows` object is an array which is described by the `headers` object. 
+
+```{r}
+as.data.frame(hts_data$rows)[1,]
+```
+
+Let us extend this analysis a bit and find facilities which have not submitted data in both Q1 and Q2 FY2018. 
+
+```{r}
+url<-paste0(baseurl,"api/26/analytics.json?dimension=SH885jaRe0o&dimension=co&dimension=dx:H7Iu1SBCLTm&dimension=ou:LEVEL-6;f5RoebaDLMx&dimension=pe:2017Q4;2018Q1&displayProperty=SHORTNAME&skipMeta=false&hierarchyMeta=true")
+r <- fromJSON(content(GET(url,authenticate(myuser,mypwd())), "text"))
+
+head(r$rows)
+```
+
+Looks like we have data for both quarters, so lets make it a bit more human-friendly. 
+
+```{r}
+metadata <- do.call(rbind,
+                      lapply(r$metaData$items,
+                             data.frame, stringsAsFactors = FALSE)) %>% 
+  mutate(., from = row.names(.))
+
+d <- as.tibble(r$rows) %>% `names<-`(., r$headers$column) %>%
+  mutate(`Value` = as.numeric(`Value`)) %>% #Convert to numeric
+  spread(`Period`, `Value`) %>% #Spread the periods into columns
+  mutate(
+  de = plyr::mapvalues(`Data`, metadata$from, metadata$name, warn_missing = FALSE),
+  coc = plyr::mapvalues(
+  `Category option combo`,
+  metadata$from,
+  metadata$name,
+  warn_missing = FALSE
+  ),
+  mech = plyr::mapvalues(`Funding Mechanism`, metadata$from, metadata$name, warn_missing = FALSE) #Remap the UIDs to names
+  ) %>%
+  inner_join(ou_structure, by = c(`Organisation unit` = "id")) %>% #Join in the OU structure
+  select(ou4, ou5, name,mech, coc, `2017Q4`, `2018Q1`) %>%
+  separate(coc,
+  into = c("Age", "Sex", "Test status"),
+  sep = ",") %>% #Separate out the disaggs into multiple columns
+  filter(!complete.cases(.)) %>% 
+  filter(!(`2017Q4` == 0 & is.na(`2018Q1`) | 
+         `2018Q1` == 0 & is.na(`2017Q4`) )) %>%
+  filter(is.na(`2018Q1`))
+head(d)
+```
+
+So, out of the `r hts_data$"Organisation unit"  %>% unique() %>% length()` sites which submitted data in either quarter `r d$name %>% unique() %>% length()` of them did not submit data in both quarters for this data element. 
+
+
+## Mechanism information
+
+The DATIM data exchange site contains useful information on data sets and data elements. Most of the information there are simply SQL views which have been made public, so we do not need to use any authentication for these requests. 
+
+Lets get a list of mechanisms and partners. 
+
+```{r}
+r_mechs<-paste0(baseurl,"api/sqlViews/fgUtV6e9YIX/data.json") %>%
+GET(.,timeout(60)) %>% 
+content(.,"text") %>%
+fromJSON(.)
+
+mechs<-as.tibble(r_mechs$rows)
+names(mechs)<-r_mechs$headers$column
+head(mechs)
+```
+
+A common request is to obtain data for partners which work in multiple operating units. We will also filter for mechs which are active for the fiscal year we are interested in. 
+
+```{r}
+mechs_fhi_360<-mechs %>% 
+filter(grepl("FHI",partner) | grepl("FHI 360",partner) ) %>%
+filter(enddate >= '2018-09-30')
+head(mechs_fhi_360)
+```
+
+We should now have all of the mechanism UIDs which we can use to filter our analytics response on. 
+
+We are going to want to try and keep our request as *nice* as possible and get facility and community level data for each operating unit. The organisation unit levels are different however, so we need to know what level each operating unit is reporting on. We can then use this as a paramater in our request.
+
+```{r}
+ous_levels<-paste0(baseurl,"api/dataStore/dataSetAssignments/ous") %>%
+ GET(.,authenticate(myuser,mypwd())) %>%
+content(.,"text") %>%
+fromJSON(.)
+ous_levels$Malawi
+```
+
+This is a list of organisation unit levels for each operating unit. So, in this case, Malawi's community level is at level 6 and the facility level at level 7 of the hierarchy. 
+
+We are going to construct the URL to retreive all data at a certain level for each mechanism and each operating unit. We are going to need a listing of all organisation units and the UIDs, so lets go ahead and get this from DATIM. 
+
+```{r}
+
+ou3s<-paste0(baseurl,"api/organisationUnits?filter=level:eq:3&paging=false") %>%
+GET(.,authenticate(myuser,mypwd())) %>%
+content(.,"text") %>%
+fromJSON(.) %>%
+rlist::list.extract("organisationUnits")
+
+
+```
+
+
+By default, analytics will aggregate data elements which are shared between community together. To avoid double-counting, we should also filter out any facility data when making the request for community data. We can do this with an organistation unit group. Lets see if we can find it
+
+```{r}
+comm_ou_group<-paste0(baseurl,"api/organisationUnitGroups?filter=name:like:Community") %>%
+   GET(.,authenticate(myuser,mypwd())) %>%
+content(.,"text") %>%
+fromJSON(.) %>%
+rlist::list.extract(.,"organisationUnitGroups") %>%
+  pull(id)
+
+comm_ou_group
+```
+Now, we need to try and get all of the data elements in the FY18 dataset. 
+
+```{r}
+fac_des_2018<-read.csv("https://www.datim.org/api/sqlViews/DotdxKrNZxG/data.csv?var=dataSets:WbszaIdCi92") %>% pull(dataelementuid) %>% unique(.)
+
+community_des_2018<-read.csv("https://www.datim.org/api/sqlViews/DotdxKrNZxG/data.csv?var=dataSets:tz1bQ3ZwUKJ") %>% pull(dataelementuid) %>% unique(.)
+
+```
+
+
+```{r}
+ous_list<-unique(mechs_fhi_360$ou)
+
+getMechanismData<-function(baseurl,mech_code,des,mechs,period) {
+  
+  #Get the mechanism of interest from the main list
+  #Get the mech UID
+  my_mech_uid<- mechs %>% filter(code == mech_code) %>% pull(uid)
+  #Get the name of  the OU from mech code
+  my_mech_ou<- mechs %>% filter(code == mech_code) %>% pull(ou)
+  #Get the community level for this OU
+  community_level<-rlist::list.extract(ous_levels,my_mech_ou)$community
+  #Get the facility level for this OU
+  facility_level<-rlist::list.extract(ous_levels,my_mech_ou)$facility
+  #Get the UID for this OU
+  ou_uid<-ou3s[ou3s$displayName == my_mech_ou,"id"]
+  assertthat::assert_that(nchar(ou_uid) == 11)
+  
+
+  fac_url<-parse_url(baseurl) %>% 
+    modify_url(path="api/26/analytics") %>%
+    modify_url(.,query = list(dimension = paste0("dx:",paste(fac_des_2018,sep="",collapse=";")),
+                              dimension = paste0("pe:",period),
+                              dimension = paste0("ou:",ou_uid,";LEVEL-",facility_level),
+                              filter = paste0("SH885jaRe0o:",my_mech_uid),
+                              displayProperty = "SHORTNAME",
+                              skipMetadata = "false"))
+
+    comm_url<-parse_url(baseurl) %>% 
+    modify_url(path="api/26/analytics") %>%
+    modify_url(.,query = list(dimension = paste0("dx:",paste(community_des_2018,sep="",collapse=";")),
+                              dimension = paste0("pe:",period),
+                              dimension = paste0("ou:",ou_uid,";LEVEL-",community_level),
+                              filter = paste0("SH885jaRe0o:",my_mech_uid),
+                              filter = paste0("mINJi7rR1a6:",comm_ou_group),
+                              displayProperty = "SHORTNAME",
+                              skipMetadata = "false"))
+    
+  fac_data<-d2_analyticsResponse(fac_url,myuser,mypwd())
+  
+  if (!is.null(fac_data)){
+    fac_data <- fac_data %>% mutate(ou_type="Facility")
+  }
+  
+  comm_data<-d2_analyticsResponse(comm_url,myuser,mypwd()) 
+    if (!is.null(fac_data)){
+    comm_data <- comm_data %>%  mutate(ou_type="Community")
+  }
+  d<-bind_rows(fac_data,comm_data) 
+  return(d)
+}
+
+getMechanismDataForPartnerList<-function(mech_code) {
+  getMechanismData(baseurl=baseurl,mech_code=mech_code,des=des,mechs=mechs,period="2018Q1")
+}
+
+bar<-tibble()
+
+for (i in 1:length(mechs_fhi_360$code)){
+  print(mechs_fhi_360$code[i])
+  foo<-getMechanismDataForPartnerList(mechs_fhi_360$code[i])
+  bar<-bind_rows(foo,bar)
+
+
+}
+
+# foo<-mclapply(mechs_fhi_360$code,getMechanismDataForPartnerList)
+
+
+```
+
+We could think about using `lapply` to apply this function over 
